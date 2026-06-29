@@ -54,6 +54,13 @@ FEEDS = [
     ("0223",                 "https://news.google.com/rss/search?q=site:0223.com.ar&hl=es-419&gl=AR&ceid=AR:es"),
     ("Rosario3",             "https://news.google.com/rss/search?q=site:rosario3.com&hl=es-419&gl=AR&ceid=AR:es"),
     ("Todo Jujuy",           "https://news.google.com/rss/search?q=site:todojujuy.com&hl=es-419&gl=AR&ceid=AR:es"),
+
+    # Nacionales — solo entran si pasan el filtro de política fuerte/impacto real
+    ("Clarín·Política",      "https://news.google.com/rss/search?q=site:clarin.com+politica&hl=es-419&gl=AR&ceid=AR:es"),
+    ("La Nación·Política",   "https://news.google.com/rss/search?q=site:lanacion.com.ar+politica&hl=es-419&gl=AR&ceid=AR:es"),
+    ("El Destape",           "https://news.google.com/rss/search?q=site:eldestape.com&hl=es-419&gl=AR&ceid=AR:es"),
+    ("Ámbito",               "https://news.google.com/rss/search?q=site:ambito.com+politica&hl=es-419&gl=AR&ceid=AR:es"),
+    ("Página 12",            "https://news.google.com/rss/search?q=site:pagina12.com.ar+politica&hl=es-419&gl=AR&ceid=AR:es"),
 ]
 
 # ── MEMORIA ───────────────────────────────────────────────────────
@@ -78,8 +85,17 @@ PUBLICÁ SI: funcionario provincial/municipal implicado, hecho en ciudad especí
 femicidio/desaparición/crimen resonante, colapso de servicio público, abuso de poder con pruebas,
 gestión provincial con datos, Colapinto/F1, Selección/Mundial.
 
-NO PUBLICÁS SI: misma nota en todos los medios nacionales, protagonista es Milei/ministros sin mención provincial,
-fuente es agencia nacional replicada, no menciona ciudad/provincia en el primer párrafo, accidente sin víctimas fatales.
+CASO ESPECIAL — medios nacionales (Clarín, La Nación, El Destape, Ámbito, Página 12):
+Publicá SOLO si es política de alto impacto real: escándalo de corrupción con pruebas concretas,
+crisis institucional, una causa judicial que avanza contra un funcionario de peso, una votación
+que define algo grande (presupuesto, reforma estructural), una ruptura política mayor.
+NO publiques agenda rutinaria: declaraciones cruzadas, polémicas de Twitter, especulación electoral,
+internas de partido sin hecho concreto, columnas de opinión de los medios.
+La pregunta filtro para estos: ¿esto define algo o es ruido del día a día? Si es ruido, no.
+
+NO PUBLICÁS SI: misma nota en todos los medios nacionales sin nada nuevo, protagonista es Milei/ministros
+sin mención provincial Y sin ser un hecho de alto impacto real, fuente es agencia nacional replicada,
+no menciona ciudad/provincia en el primer párrafo (salvo el caso especial de arriba), accidente sin víctimas fatales.
 
 Respondé SOLO JSON sin explicaciones:
 {"publicar": true/false, "razon": "una línea", "region": "NOA/NEA/Cuyo/Litoral/Patagonia/Prov-BsAs/Nacional", "seccion": "politica/economia/actualidad/deportes/opinion"}"""
@@ -113,15 +129,113 @@ def reescribir(titulo, contenido, fuente):
     except Exception as e:
         log.error(f"Error reescribiendo: {e}"); return None
 
+def extraer_imagen(entry) -> Optional[str]:
+    """Busca una imagen en el item del feed RSS."""
+    try:
+        # 1. media_thumbnail (lo más común en Google News)
+        if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+            return entry.media_thumbnail[0].get("url")
+
+        # 2. media_content
+        if hasattr(entry, "media_content") and entry.media_content:
+            return entry.media_content[0].get("url")
+
+        # 3. enclosures (algunos feeds usan esto)
+        if hasattr(entry, "enclosures") and entry.enclosures:
+            for enc in entry.enclosures:
+                if "image" in enc.get("type", ""):
+                    return enc.get("href") or enc.get("url")
+
+        # 4. buscar <img> dentro del HTML del resumen
+        import re
+        html = entry.get("summary", entry.get("description", ""))
+        match = re.search(r'<img[^>]+src="([^"]+)"', html)
+        if match:
+            return match.group(1)
+
+    except Exception as e:
+        log.error(f"Error extrayendo imagen: {e}")
+    return None
+
+def subir_imagen_wp(url_imagen: str, titulo: str) -> Optional[int]:
+    """Descarga la imagen y la sube a WordPress, devuelve el media ID."""
+    try:
+        img_resp = requests.get(url_imagen, timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"})
+        if img_resp.status_code != 200:
+            return None
+
+        content_type = img_resp.headers.get("Content-Type", "image/jpeg")
+        ext = "jpg" if "jpeg" in content_type else content_type.split("/")[-1]
+        filename = f"{hashlib.md5(titulo.encode()).hexdigest()[:10]}.{ext}"
+
+        r = requests.post(
+            f"{WP_URL}/wp-json/wp/v2/media",
+            data=img_resp.content,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Type": content_type,
+            },
+            auth=(WP_USER, WP_APP_PASSWORD),
+            timeout=20
+        )
+        if r.status_code in [200, 201]:
+            media_id = r.json().get("id")
+            log.info(f"📷 Imagen subida, media_id={media_id}")
+            return media_id
+        log.error(f"Error subiendo imagen: {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        log.error(f"Error subir_imagen_wp: {e}")
+    return None
+
 # ── WORDPRESS ─────────────────────────────────────────────────────
-def publicar_wp(titulo, copete, cuerpo, region, seccion):
+_categorias_cache = {}
+
+def obtener_categoria_id(nombre_region: str) -> Optional[int]:
+    """Busca el ID de categoría en WordPress según el nombre de región."""
+    global _categorias_cache
+
+    # Mapea nombre de región del bot -> nombre de categoría en WordPress
+    mapa_nombres = {
+        "NOA": "NOA", "NEA": "NEA", "Cuyo": "Cuyo",
+        "Litoral": "Litoral", "Patagonia": "Patagonia",
+        "Prov-BsAs": "Prov. BsAs", "Nacional": "Actualidad",
+    }
+    nombre_wp = mapa_nombres.get(nombre_region, "Actualidad")
+
+    if not _categorias_cache:
+        try:
+            r = requests.get(f"{WP_URL}/wp-json/wp/v2/categories?per_page=100",
+                              auth=(WP_USER, WP_APP_PASSWORD), timeout=10)
+            if r.status_code == 200:
+                for cat in r.json():
+                    _categorias_cache[cat["name"]] = cat["id"]
+                log.info(f"Categorías cargadas: {list(_categorias_cache.keys())}")
+        except Exception as e:
+            log.error(f"Error cargando categorías: {e}")
+
+    return _categorias_cache.get(nombre_wp)
+
+def publicar_wp(titulo, copete, cuerpo, region, seccion, imagen_url=None):
     try:
         contenido = f"<p><em>{copete}</em></p>\n\n<p>{cuerpo.replace(chr(10)+chr(10), '</p><p>')}</p>"
-        r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts",
-            json={"title": titulo, "content": contenido, "excerpt": copete, "status": "publish"},
+        payload = {"title": titulo, "content": contenido, "excerpt": copete, "status": "publish"}
+
+        cat_id = obtener_categoria_id(region)
+        if cat_id:
+            payload["categories"] = [cat_id]
+        else:
+            log.warning(f"No se encontró categoría para región '{region}', publica sin categoría")
+
+        if imagen_url:
+            media_id = subir_imagen_wp(imagen_url, titulo)
+            if media_id:
+                payload["featured_media"] = media_id
+
+        r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
             auth=(WP_USER, WP_APP_PASSWORD), timeout=15)
         if r.status_code in [200, 201]:
-            log.info(f"✅ Publicado: {titulo}"); return True
+            log.info(f"✅ Publicado: {titulo} (categoría: {region})"); return True
         log.error(f"WP error {r.status_code}: {r.text[:200]}"); return False
     except Exception as e:
         log.error(f"Error WP: {e}"); return False
@@ -152,9 +266,10 @@ async def procesar_feeds(app):
                 if not g: continue
 
                 pid = hashlib.md5(g["titulo"].encode()).hexdigest()[:8]
+                imagen_url = extraer_imagen(e)
                 pendientes[pid] = {"titulo":g["titulo"],"copete":g["copete"],"cuerpo":g["cuerpo"],
                     "region":ev.get("region","Nacional"),"seccion":ev.get("seccion","actualidad"),
-                    "fuente":fuente,"link":link}
+                    "fuente":fuente,"link":link,"imagen_url":imagen_url}
 
                 emoji = emojis.get(ev.get("region",""), "📰")
                 msg = (f"{emoji} *{ev.get('region','').upper()}* · _{ev.get('seccion','').upper()}_\n\n"
@@ -186,7 +301,8 @@ async def callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pid = data[4:]
         nota = pendientes.get(pid)
         if nota:
-            ok = publicar_wp(nota["titulo"], nota["copete"], nota["cuerpo"], nota["region"], nota["seccion"])
+            ok = publicar_wp(nota["titulo"], nota["copete"], nota["cuerpo"],
+                              nota["region"], nota["seccion"], nota.get("imagen_url"))
             if ok:
                 await query.edit_message_text(f"✅ *Publicado en La Aurora*\n\n*{nota['titulo']}*", parse_mode="Markdown")
                 del pendientes[pid]
@@ -262,3 +378,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
